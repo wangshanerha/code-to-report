@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code to Report · 代码技术报告"
+  short_description: "生成包含完整流程图、清晰分支、逐步输入输出和贯穿实例的离线 HTML 代码技术报告"
+  default_prompt: "使用 $code-to-report 分析当前项目，生成包含完整流程图、所有重要分支、逐步输入输出、实现细节与贯穿示例的中文 HTML 技术报告。"

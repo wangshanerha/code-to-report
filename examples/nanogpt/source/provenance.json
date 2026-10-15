@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/karpathy/nanoGPT",
+  "revision": "3adf61e154c3fe3fca428ad6bc3818b27a3b8291",
+  "retrieved": "2026-10-14",
+  "files": [
+    "model.py",
+    "train.py",
+    "sample.py",
+    "LICENSE",
+    "README.md"
+  ],
+  "sha256": {
+    "LICENSE": "a59ec5cdb1c1e447e5266a014b3e7ded511f8d6e5a08931e931c87490ff821fe",
+    "model.py": "7c01703240dbec5d554527dc666e35b3df8391d0b117fddc07afcf325a21d11c",
+    "README.md": "8d969370683849a2cc4e46c81bf2449717f2daff657586888151933c3590f85f",
+    "sample.py": "1c4bb3716ec55395be2e6ad136693614b0b38de9defda889041efe2057a0c1f1",
+    "train.py": "413bd97b40bb400a2a0d01230e2946f056c263ebac1b7281c2367d964a123085"
+  }
+}

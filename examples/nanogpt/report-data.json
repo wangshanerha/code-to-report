@@ -1,0 +1,2186 @@
+{
+  "title": "读懂 nanoGPT：从输入到生成",
+  "subtitle": "固定版本源码导读 · 完整前向、Block、Attention 与生成循环 · 每一步都有输入输出与可追踪的例子",
+  "version": "karpathy/nanoGPT · 3adf61e154c3fe3fca428ad6bc3818b27a3b8291 · 分析日期 2026-10-14 · 源码快照未修改",
+  "summary": [
+    "nanoGPT 的模型核心是一套 decoder-only GPT：读入一段 token ID，用因果注意力逐层变换隐藏向量，再预测后续 token。训练时把每个位置的预测与右移标签比较；生成时取最后位置分数，抽样一个 token，再循环。",
+    "这份报告先给整体前向图，再展开 Block 和 Attention，最后把它们放回生成循环。流程节点、步骤卡片、案例和固定版本源码互相链接。你可以按图读，也可以选择案例查看它真正经过的分支。"
+  ],
+  "scope": [
+    "完整分析 model.py 的全部类与方法；对 forward、Block、Attention、generate 四个核心运行流程逐节点展开，辅助初始化、权重加载、优化器、统计和裁剪方法在模块清单中解释输入输出、步骤和分支。",
+    "train.py 与 sample.py 仅用于解释调用连接。未分析所有数据准备器、配置文件、DDP、检查点和编译后端的完整运行流程。不是整个 nanoGPT 仓库的全覆盖报告，也不是当前商业 GPT 产品的内部实现说明。",
+    "环境未安装 PyTorch，未运行原始 nanoGPT、训练或下载模型权重。张量形状来自代码推演；数值教学例子由独立的 Python 标准库计算，不冒充模型输出。"
+  ],
+  "config": {
+    "B": 1,
+    "T": 3,
+    "C": 4,
+    "H": 2,
+    "head_dim": 2,
+    "n_layer": 2,
+    "vocab_size": 8,
+    "block_size": 4,
+    "dropout": 0.0,
+    "bias": true,
+    "note": "教学微型配置，非上游默认；token ID 为教学构造，不对应真实文本编码。"
+  },
+  "technologies": [
+    {
+      "name": "Token / Position Embedding",
+      "problem": "离散 ID 怎样成为可计算向量？",
+      "principle": "Embedding 本质是按 ID 查参数矩阵的行；位置向量提供顺序信息。",
+      "usage": "wte(idx) + wpe(arange(T))，随后 Dropout。位置 Embedding 是学习参数。",
+      "limit": "此实现使用学习的绝对位置向量，不是 RoPE。源码：model.py:126–138,174–179。"
+    },
+    {
+      "name": "Causal Multi-head Attention",
+      "problem": "怎样利用上下文，又不偷看答案？",
+      "principle": "Q/K 决定对可见位置的权重，V 提供被汇总的内容；下三角遮罩禁止看未来。",
+      "usage": "一次 Linear(C,3C) 产生 Q/K/V，拆 H 个头，再用 SDPA 或显式矩阵路径计算。",
+      "limit": "SDPA 接口可用不保证实际 FlashAttention 内核；本报告未测速度或显存。源码：model.py:29–76。"
+    },
+    {
+      "name": "Pre-LN / Residual / MLP",
+      "problem": "每层怎样更新特征并保留已有状态？",
+      "principle": "先归一化再变换，残差相加；MLP 做逐位置非线性特征变换。",
+      "usage": "x+attn(ln_1(x))；然后 x+mlp(ln_2(x))。MLP 中间维度 4C。",
+      "limit": "形状不变不代表内容不变；MLP 不直接跨 token 混合。源码：model.py:18–27,78–106。"
+    },
+    {
+      "name": "Next-token Loss / Sampling",
+      "problem": "怎样学习预测，又怎样生成？",
+      "principle": "训练用右移标签上的交叉熵；生成把 logits 转概率，再采一个 token。",
+      "usage": "有 targets 算全位置 loss；无 targets 只投影最后位置。generate 加温度与可选 top-k。",
+      "limit": "这份实现没有 KV cache 或 EOS 早停；训练输出分支由 targets 决定。源码：model.py:170–193,305–330。"
+    }
+  ],
+  "flows": [
+    {
+      "id": "forward",
+      "short_title": "模型完整前向",
+      "title": "01 · 从 token ID 到 logits / loss",
+      "intro": [
+        "这是 GPT.forward 的完整主路径。输入已经是 token ID，不是原始中文或英文字符串。文字编码发生在 sample.py 或数据准备程序中。",
+        "B 为批次数，T 为序列长度，C 为隐藏维度，V 为词表大小。注意：输出分支由 targets 是否为 None 决定，而不是由 model.train() / model.eval() 决定。"
+      ],
+      "nodes": [
+        {
+          "id": "F01",
+          "title": "接收 token 与可选标签",
+          "subtitle": "idx [B,T]；targets 可为 None",
+          "row": 0,
+          "col": 1,
+          "input": "idx: LongTensor[B,T]；可选 targets[B,T]",
+          "output": "读取 b,t 和 idx.device",
+          "details": [
+            "idx.size() 必须能解包为两个维度。token ID 需在词表范围内；targets 的结构应与 idx 对齐。",
+            "此函数不负责分词，也不会自动把 idx 右移生成标签；调用者必须准备好 targets。"
+          ],
+          "example": "教学词表 V=8：idx=[[1,2,3]]，targets=[[2,3,4]]。这些 ID 不是 GPT-2 分词器的实际编码。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "F02",
+          "title": "序列长度是否允许？",
+          "subtitle": "assert T <= block_size",
+          "row": 1,
+          "col": 1,
+          "input": "t 与 config.block_size",
+          "output": "通过断言，或抛出 AssertionError",
+          "details": [
+            "直接 forward 只检查长度并断言，不会自动裁剪输入。",
+            "生成循环会在调用 forward 前裁剪上下文；这是两个不同位置的行为。"
+          ],
+          "example": "block_size=4 时，T=3 通过；直接输入 T=5 会失败。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "decision"
+        },
+        {
+          "id": "FX",
+          "title": "超长输入：断言失败",
+          "subtitle": "本次 forward 终止",
+          "row": 1,
+          "col": 2,
+          "input": "T > block_size",
+          "output": "AssertionError；没有 logits/loss",
+          "details": [
+            "断言包含实际长度和允许的最大长度。",
+            "不会进入 Embedding、Attention 或损失计算。其他错误如越界 ID 可能在后续 PyTorch 操作中抛出。"
+          ],
+          "example": "idx=[[0,1,2,3,4]] 且 block_size=4：在进入 Embedding 前终止。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "terminal"
+        },
+        {
+          "id": "F03",
+          "title": "Token + Position Embedding",
+          "subtitle": "查表、相加、Dropout",
+          "row": 2,
+          "col": 1,
+          "input": "idx[B,T]；pos=arange(T)[T]",
+          "output": "x[B,T,C]",
+          "details": [
+            "wte 将每个 token ID 查成 C 维向量，得到 [B,T,C]。",
+            "wpe 将位置 0..T-1 查成 [T,C]，沿 batch 维广播相加。",
+            "transformer.drop 对相加结果做 Dropout；概率由配置决定，是否激活由 training 状态决定。"
+          ],
+          "example": "B=1,T=3,C=4：token 向量 [1,3,4] 加位置向量 [3,4]，输出仍为 [1,3,4]；具体元素依赖模型权重。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "F04",
+          "title": "依次通过全部 Block",
+          "subtitle": "for block in transformer.h",
+          "row": 3,
+          "col": 1,
+          "input": "x[B,T,C]",
+          "output": "x[B,T,C]；经过 n_layer 层",
+          "details": [
+            "按 ModuleList 顺序执行，每个 Block 的输出成为下一个的输入。",
+            "每层有独立参数，不是重复调用同一组权重。",
+            "Block 内部包含两次 Pre-LayerNorm、注意力、MLP 和两条残差，见子流程。"
+          ],
+          "example": "n_layer=2 时，x[1,3,4] → Block 0 → x[1,3,4] → Block 1 → x[1,3,4]。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "step",
+          "subflow": "block"
+        },
+        {
+          "id": "F05",
+          "title": "最终 LayerNorm",
+          "subtitle": "transformer.ln_f",
+          "row": 4,
+          "col": 1,
+          "input": "最后一层 Block 输出[B,T,C]",
+          "output": "归一化后的 x[B,T,C]",
+          "details": [
+            "在每个 token 的最后一维 C 上归一化。",
+            "使用可学习缩放 weight、可选 bias，以及 epsilon=1e-5；形状不变。"
+          ],
+          "example": "输入是 3 个 4 维 token 向量，归一化分别在各自的 4 个通道上进行，不混合不同 token。",
+          "sources": [
+            "ln"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "F06",
+          "title": "是否传入 targets？",
+          "subtitle": "targets is not None",
+          "row": 5,
+          "col": 1,
+          "input": "x[B,T,C] 与 targets",
+          "output": "选择全位置损失分支或末位置分支",
+          "details": [
+            "这是输出和损失的分界点。",
+            "eval() 但传 targets 仍算 loss；train() 但 targets=None 仍走末位置 logits 分支。Dropout 则由 training 状态控制。"
+          ],
+          "example": "targets=[[2,3,4]] 时走 F07；targets=None 时走 F08。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "decision"
+        },
+        {
+          "id": "F07",
+          "title": "全位置投影 + 交叉熵",
+          "subtitle": "[B,T,C] → [B,T,V]",
+          "row": 6,
+          "col": 0,
+          "input": "x[B,T,C]；targets[B,T]",
+          "output": "logits[B,T,V]；标量 loss",
+          "details": [
+            "lm_head 把每个位置的隐藏向量投影到词表，输出未归一化的 logits。",
+            "把 logits 展平成 [B*T,V]、targets 展成 [B*T]，调用 cross_entropy；它内部完成 log-softmax / NLL 计算。",
+            "ignore_index=-1 的目标位置不参与损失。返回的是默认 reduction 的标量损失。"
+          ],
+          "example": "V=8、B=1、T=3：logits[1,3,8] → [3,8]，targets[1,3] → [3]；3 个位置共同贡献平均 loss。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "F08",
+          "title": "仅投影最后一个位置",
+          "subtitle": "[B,1,C] → [B,1,V]",
+          "row": 6,
+          "col": 2,
+          "input": "x[B,T,C]；targets=None",
+          "output": "logits[B,1,V]；loss=None",
+          "details": [
+            "x[:,[-1],:] 保留长度为 1 的时间维，而非降成二维。",
+            "只减少最后的 lm_head 投影开销；前面的 Embedding 和所有 Block 仍处理整个输入上下文。"
+          ],
+          "example": "x[1,3,4] 取成 [1,1,4]，投影得到 [1,1,8]，用于预测紧接输入之后的一个 token。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "F09",
+          "title": "返回 logits 与 loss",
+          "subtitle": "两个返回值，形状由分支决定",
+          "row": 7,
+          "col": 1,
+          "input": "F07 或 F08 的结果",
+          "output": "(logits, loss)",
+          "details": [
+            "标签分支可继续反向传播；无标签分支可交给生成函数做采样。",
+            "forward 自身不更新参数，也不把 logits 解码成文本。"
+          ],
+          "example": "有标签返回 ([1,3,8],标量)；无标签返回 ([1,1,8],None)。",
+          "sources": [
+            "fwd"
+          ],
+          "kind": "terminal"
+        }
+      ],
+      "edges": [
+        {
+          "from": "F01",
+          "to": "F02",
+          "label": "读取 T"
+        },
+        {
+          "from": "F02",
+          "to": "FX",
+          "label": "否：超长",
+          "from_side": "right",
+          "to_side": "left"
+        },
+        {
+          "from": "F02",
+          "to": "F03",
+          "label": "是：T 合法"
+        },
+        {
+          "from": "F03",
+          "to": "F04",
+          "label": "隐藏序列 [B,T,C]"
+        },
+        {
+          "from": "F04",
+          "to": "F05",
+          "label": "完成 n_layer 层"
+        },
+        {
+          "from": "F05",
+          "to": "F06",
+          "label": "归一化隐藏序列"
+        },
+        {
+          "from": "F06",
+          "to": "F07",
+          "label": "是：有 targets"
+        },
+        {
+          "from": "F06",
+          "to": "F08",
+          "label": "否：targets=None"
+        },
+        {
+          "from": "F07",
+          "to": "F09",
+          "label": "全位置 logits + loss"
+        },
+        {
+          "from": "F08",
+          "to": "F09",
+          "label": "末位置 logits + None"
+        }
+      ]
+    },
+    {
+      "id": "block",
+      "short_title": "Block 内部",
+      "title": "02 · 一个 Transformer Block 内部做什么",
+      "intro": [
+        "这张图展开 F04 中的一层。整个 Block 不改变 [B,T,C] 的外部形状；注意力混合可见位置的信息，MLP 则变换各位置的特征。"
+      ],
+      "nodes": [
+        {
+          "id": "B01",
+          "title": "第一层归一化",
+          "subtitle": "LayerNorm(x)",
+          "row": 0,
+          "col": 0,
+          "input": "x[B,T,C]",
+          "output": "z1[B,T,C]",
+          "details": [
+            "保存原 x 供残差使用，只对当前 token 的通道维做归一化。",
+            "F.layer_norm 使用学习的 weight、可选 bias 和 epsilon=1e-5。"
+          ],
+          "example": "x[1,3,4] → z1[1,3,4]，token 数量不变。",
+          "sources": [
+            "ln"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "B02",
+          "title": "因果自注意力",
+          "subtitle": "attn(z1)",
+          "row": 1,
+          "col": 0,
+          "input": "z1[B,T,C]",
+          "output": "a[B,T,C]",
+          "details": [
+            "把归一化输入交给 CausalSelfAttention，内部多头计算见注意力图。",
+            "输出是可与原 x 相加的 C 维向量。"
+          ],
+          "example": "a[1,3,4] 的第 2 个位置只依赖第 1、2 个位置。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step",
+          "subflow": "attention"
+        },
+        {
+          "id": "B03",
+          "title": "第一条残差",
+          "subtitle": "x = x + a",
+          "row": 2,
+          "col": 0,
+          "input": "原 x[B,T,C] 与 a[B,T,C]",
+          "output": "x1[B,T,C]",
+          "details": [
+            "逐元素相加，保留原状态并加入注意力变换。",
+            "输入和注意力输出形状必须相同，不拼接、不增加通道。"
+          ],
+          "example": "两个 [1,3,4] 相加仍为 [1,3,4]。",
+          "sources": [
+            "block"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "B04",
+          "title": "第二层归一化",
+          "subtitle": "ln_2(x1)",
+          "row": 3,
+          "col": 0,
+          "input": "x1[B,T,C]",
+          "output": "z2[B,T,C]",
+          "details": [
+            "使用另一组 LayerNorm 参数。",
+            "这是 Pre-LN：MLP 之前归一化；残差主干仍保留未归一化的 x1。"
+          ],
+          "example": "z2[1,3,4] 与 z1 形状相同，但参数和输入不同。",
+          "sources": [
+            "block"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "B05",
+          "title": "MLP 升维与 GELU",
+          "subtitle": "C → 4C → GELU",
+          "row": 4,
+          "col": 0,
+          "input": "z2[B,T,C]",
+          "output": "中间激活[B,T,4C]",
+          "details": [
+            "c_fc 是 Linear(C,4C)，把每个 token 的特征升维。",
+            "GELU 逐元素施加非线性。MLP 不直接混合不同 token 的位置。"
+          ],
+          "example": "C=4：每个 token 从 4 维变 16 维，整体 [1,3,4] → [1,3,16]。",
+          "sources": [
+            "mlp"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "B06",
+          "title": "MLP 降维与 Dropout",
+          "subtitle": "4C → C",
+          "row": 5,
+          "col": 0,
+          "input": "中间激活[B,T,4C]",
+          "output": "m[B,T,C]",
+          "details": [
+            "c_proj 将 4C 投影回 C。",
+            "再做配置概率的 Dropout，确保输出能参与残差相加。"
+          ],
+          "example": "[1,3,16] → [1,3,4]；输出是特征变换，不是词表概率。",
+          "sources": [
+            "mlp"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "B07",
+          "title": "第二条残差并返回",
+          "subtitle": "return x1 + m",
+          "row": 6,
+          "col": 0,
+          "input": "x1[B,T,C] 与 m[B,T,C]",
+          "output": "下一层 Block 的输入[B,T,C]",
+          "details": [
+            "逐元素相加并返回。",
+            "源码两行残差计算中，第一条使用原 x，第二条使用已经更新的 x1。"
+          ],
+          "example": "n_layer=2 时，本结果进入第二个 Block；最后一个 Block 的结果进入 ln_f。",
+          "sources": [
+            "block"
+          ],
+          "kind": "terminal"
+        }
+      ],
+      "edges": [
+        {
+          "from": "B01",
+          "to": "B02",
+          "label": "z1[B,T,C]"
+        },
+        {
+          "from": "B02",
+          "to": "B03",
+          "label": "原 x[B,T,C] 与 a[B,T,C]"
+        },
+        {
+          "from": "B03",
+          "to": "B04",
+          "label": "x1[B,T,C]"
+        },
+        {
+          "from": "B04",
+          "to": "B05",
+          "label": "z2[B,T,C]"
+        },
+        {
+          "from": "B05",
+          "to": "B06",
+          "label": "中间激活[B,T,4C]"
+        },
+        {
+          "from": "B06",
+          "to": "B07",
+          "label": "x1[B,T,C] 与 m[B,T,C]"
+        }
+      ]
+    },
+    {
+      "id": "attention",
+      "short_title": "Attention 两条分支",
+      "title": "03 · 多头因果注意力：拆头、遮罩，再合并",
+      "intro": [
+        "核心计算是 softmax(QKᵀ / √d + causal mask)V。训练状态影响 Dropout；因果遮罩确保当前位置不能看未来 token。",
+        "源码把 hasattr(F,\"scaled_dot_product_attention\") 命名为 self.flash。它仅检查接口是否存在；具体使用哪种后端由 PyTorch 运行环境决定，不等于保证调用 FlashAttention CUDA 内核。"
+      ],
+      "nodes": [
+        {
+          "id": "A01",
+          "title": "接收归一化隐藏状态",
+          "subtitle": "x [B,T,C]",
+          "row": 0,
+          "col": 1,
+          "input": "x[B,T,C]，且 C % H == 0",
+          "output": "读取 B,T,C；每头维度 d=C/H",
+          "details": [
+            "n_embd % n_head == 0 在构造注意力模块时断言。",
+            "此处输入来自 B01 的 LayerNorm 输出，不是 token ID。"
+          ],
+          "example": "C=4,H=2，因此每头 d=2。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "A02",
+          "title": "一次投影，拆成 Q/K/V",
+          "subtitle": "[B,T,3C] → 3×[B,H,T,d]",
+          "row": 1,
+          "col": 1,
+          "input": "x[B,T,C]",
+          "output": "q,k,v 各为[B,H,T,d]",
+          "details": [
+            "c_attn 是 Linear(C,3C)，然后按最后一维 split(C)。",
+            "每个 Q/K/V 先 view(B,T,H,d)，再 transpose(1,2) 把 head 放到第二维。"
+          ],
+          "example": "[1,3,4] → [1,3,12] → 三个 [1,3,4] → 三个 [1,2,3,2]。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "A03",
+          "title": "SDPA 接口可用吗？",
+          "subtitle": "if self.flash",
+          "row": 2,
+          "col": 1,
+          "input": "初始化时缓存的布尔标志",
+          "output": "选择接口分支或显式矩阵分支",
+          "details": [
+            "构造时通过 hasattr 检查 F.scaled_dot_product_attention。",
+            "不是每个 token 动态选择，且并非按是否训练来选择；两条路径都遵守因果约束。"
+          ],
+          "example": "可用：走 A04；不可用：走 A05、A06。实际后端未在本环境运行核实。",
+          "sources": [
+            "att"
+          ],
+          "kind": "decision"
+        },
+        {
+          "id": "A04",
+          "title": "调用 PyTorch SDPA",
+          "subtitle": "is_causal=True",
+          "row": 3,
+          "col": 0,
+          "input": "q,k,v[B,H,T,d]",
+          "output": "y[B,H,T,d]",
+          "details": [
+            "传入 attn_mask=None、is_causal=True。",
+            "dropout_p 在 training 状态取配置 dropout，否则强制为 0。",
+            "注意力分数的具体中间张量不由这段代码显式创建；不能据此断言实际显存占用或速度。"
+          ],
+          "example": "q/k/v[1,2,3,2] → y[1,2,3,2]。dropout=0 时，无论 train/eval，此处概率都是 0。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "A05",
+          "title": "显式算分数与因果遮罩",
+          "subtitle": "QKᵀ / √d；未来置 −∞",
+          "row": 3,
+          "col": 2,
+          "input": "q,k[B,H,T,d]",
+          "output": "遮罩后的 scores[B,H,T,T]",
+          "details": [
+            "q @ k.transpose(-2,-1) 计算每个 query 与各 key 的匹配分数，并乘 1/sqrt(d)。",
+            "取注册下三角遮罩的 [:,:,:T,:T] 部分；未来位置的分数填为 -inf。",
+            "遮罩仅在没有 SDPA 接口时注册为 buffer，它不是训练参数。"
+          ],
+          "example": "T=3 时，可见关系为 [[1,0,0],[1,1,0],[1,1,1]]；第一个 token 只能看自己。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "A06",
+          "title": "归一化权重并汇总 V",
+          "subtitle": "softmax → Dropout → @V",
+          "row": 4,
+          "col": 2,
+          "input": "scores[B,H,T,T]；v[B,H,T,d]",
+          "output": "y[B,H,T,d]",
+          "details": [
+            "softmax 沿最后一维，对可见 key 位置归一化。",
+            "attn_dropout 按模块 training 状态工作；然后权重乘 v 得到每个 query 的加权结果。"
+          ],
+          "example": "第一个位置的权重为 [1,0,0]，所以其输出就是对应的第一个 V。完整教学数值见贯穿实例之后。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "A07",
+          "title": "合并多头与输出投影",
+          "subtitle": "transpose → contiguous → view",
+          "row": 5,
+          "col": 1,
+          "input": "y[B,H,T,d]",
+          "output": "投影与 Dropout 后[B,T,C]",
+          "details": [
+            "transpose(1,2) 还原成 [B,T,H,d]；contiguous 后 view 成 [B,T,C]。",
+            "c_proj 是 Linear(C,C)，再应用 resid_dropout。",
+            "合并是拼回各头通道，不是求平均。"
+          ],
+          "example": "[1,2,3,2] → [1,3,2,2] → [1,3,4] → 线性投影后 [1,3,4]。",
+          "sources": [
+            "att"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "A08",
+          "title": "返回注意力增量",
+          "subtitle": "交回第一条残差",
+          "row": 6,
+          "col": 1,
+          "input": "最终注意力输出[B,T,C]",
+          "output": "a[B,T,C]；由 B03 与主干相加",
+          "details": [
+            "注意力模块本身没有做外层残差加法，残差发生在 Block.forward。",
+            "输出不是 token 概率；词表投影发生在 GPT.lm_head。"
+          ],
+          "example": "返回 a[1,3,4]，再计算 x+a。",
+          "sources": [
+            "att"
+          ],
+          "kind": "terminal"
+        }
+      ],
+      "edges": [
+        {
+          "from": "A01",
+          "to": "A02",
+          "label": "隐藏序列"
+        },
+        {
+          "from": "A02",
+          "to": "A03",
+          "label": "Q / K / V"
+        },
+        {
+          "from": "A03",
+          "to": "A04",
+          "label": "是：接口存在"
+        },
+        {
+          "from": "A03",
+          "to": "A05",
+          "label": "否：显式计算"
+        },
+        {
+          "from": "A05",
+          "to": "A06",
+          "label": "masked scores"
+        },
+        {
+          "from": "A04",
+          "to": "A07",
+          "label": "y [B,H,T,d]",
+          "via": [
+            [
+              170,
+              755
+            ],
+            [
+              500,
+              755
+            ]
+          ]
+        },
+        {
+          "from": "A06",
+          "to": "A07",
+          "label": "y [B,H,T,d]"
+        },
+        {
+          "from": "A07",
+          "to": "A08",
+          "label": "attention output"
+        }
+      ]
+    },
+    {
+      "id": "generation",
+      "short_title": "生成循环与采样",
+      "title": "04 · 如何一个 token、一个 token 地生成",
+      "intro": [
+        "generate 接收已经编码的 idx，循环 max_new_tokens 次；每次只采一个新 token，再把它拼回完整序列。@torch.no_grad() 关闭梯度记录，但不会自动调用 eval()。",
+        "这份实现没有 KV cache，也没有遇到 EOS 提前停止的逻辑。每轮重新计算裁剪后的完整上下文；完整 idx 继续增长，裁剪只作用于送入 forward 的 idx_cond。"
+      ],
+      "nodes": [
+        {
+          "id": "G00",
+          "title": "接收生成参数",
+          "subtitle": "idx；max_new_tokens；温度；top_k",
+          "row": 0,
+          "col": 1,
+          "input": "idx[B,L]；max_new_tokens=N；temperature；top_k",
+          "output": "进入无梯度生成循环",
+          "details": [
+            "调用者应先设置 model.eval() 以关闭 Dropout；sample.py 会这样做。",
+            "temperature 应为正，top_k 若设置应为正整数；函数本身未显式验证这些参数。",
+            "生成接口本身不分词、不解码，也不加载权重。"
+          ],
+          "example": "教学输入 idx=[[0,1,2,3,4]]，block_size=4，N=1，temperature=1，top_k=2。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G01",
+          "title": "是否还需生成？",
+          "subtitle": "for _ in range(N)",
+          "row": 1,
+          "col": 1,
+          "input": "循环计数与 max_new_tokens",
+          "output": "继续一次迭代，或返回 idx",
+          "details": [
+            "源码为固定次数的 for 循环，此节点把隐含循环控制画出来。",
+            "N=0 时不调用 forward，直接返回原序列；没有 EOS 检查。"
+          ],
+          "example": "N=1 时第一次进入；拼接 1 个 token 后循环结束。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "decision"
+        },
+        {
+          "id": "G02",
+          "title": "当前序列是否过长？",
+          "subtitle": "idx.size(1) <= block_size",
+          "row": 2,
+          "col": 1,
+          "input": "完整 idx[B,L]",
+          "output": "选择保留全部或保留末尾窗口",
+          "details": [
+            "这里判断的是完整生成序列当前的长度 L。",
+            "等于 block_size 时不裁剪；只有大于时才切片。"
+          ],
+          "example": "L=5、block_size=4：过长，走 G04；L=3 时走 G03。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "decision"
+        },
+        {
+          "id": "G03",
+          "title": "保留整个上下文",
+          "subtitle": "idx_cond = idx",
+          "row": 3,
+          "col": 0,
+          "input": "idx[B,L]，L<=block_size",
+          "output": "idx_cond[B,L]",
+          "details": [
+            "直接引用当前 idx 作为模型上下文。",
+            "原始序列和送入模型的上下文相同。"
+          ],
+          "example": "[[1,2,3]] 保持为 [[1,2,3]]。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G04",
+          "title": "截取末尾上下文",
+          "subtitle": "idx[:, -block_size:] ",
+          "row": 3,
+          "col": 2,
+          "input": "idx[B,L]，L>block_size",
+          "output": "idx_cond[B,block_size]",
+          "details": [
+            "只把最后 block_size 个 token 送入模型。",
+            "原始 idx 不丢 token；随后拼接仍基于完整 idx。",
+            "forward 会重新从位置 0 编到窗口长度-1，使用学习的位置 Embedding。"
+          ],
+          "example": "原序列 [[0,1,2,3,4]] 保留；idx_cond=[[1,2,3,4]]。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G05",
+          "title": "调用完整前向",
+          "subtitle": "self(idx_cond)；不传 targets",
+          "row": 4,
+          "col": 1,
+          "input": "idx_cond[B,T]，T<=block_size",
+          "output": "logits[B,1,V]；loss=None",
+          "details": [
+            "经过 F01..F09，固定走 targets=None 的末位置输出分支。",
+            "没有 KV cache，所以每次重新执行上下文的所有 Block。"
+          ],
+          "example": "本例上下文 [1,4] → logits[1,1,8]，这里不声称任何真实 logits 数值。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step",
+          "subflow": "forward"
+        },
+        {
+          "id": "G06",
+          "title": "末位置分数除以温度",
+          "subtitle": "logits[:, -1, :] / temperature",
+          "row": 5,
+          "col": 1,
+          "input": "logits[B,1,V]；temperature>0",
+          "output": "scaled logits[B,V]",
+          "details": [
+            "去掉时间维，并把每个词表分数除以温度。",
+            "在分数非退化时，较小正温度使分布更集中，较大温度使分布更平；不是简单取最大值。"
+          ],
+          "example": "教学 logits=[1,2,0,-1,0.5,-0.5,1.5,-2]；温度 1 时不变，温度 0.5 时每项乘 2。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G07",
+          "title": "是否启用 top-k？",
+          "subtitle": "top_k is not None",
+          "row": 6,
+          "col": 1,
+          "input": "scaled logits[B,V]；top_k",
+          "output": "选择阈值过滤或保留全部分数",
+          "details": [
+            "None 才表示不做 top-k；不是 0。",
+            "k 被限制为 min(top_k,V)，但源码没有防止非正 k。"
+          ],
+          "example": "top_k=2 走 G08；top_k=None 直接走 G09。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "decision"
+        },
+        {
+          "id": "G08",
+          "title": "按第 k 大分数过滤",
+          "subtitle": "低于阈值的分数置 −∞",
+          "row": 7,
+          "col": 0,
+          "input": "scaled logits[B,V]",
+          "output": "过滤后的 logits[B,V]",
+          "details": [
+            "torch.topk 得到第 k 大分数阈值。低于阈值才屏蔽，等于阈值的并列分数会留下。",
+            "因此存在并列时，保留数量可能超过 k；不能把这段代码解释成严格只剩 k 个 token。"
+          ],
+          "example": "教学 V=8,k=2：保留 ID 1 的 2.0 和 ID 6 的 1.5，其余置 -inf。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G09",
+          "title": "softmax 得到概率",
+          "subtitle": "沿词表维归一化",
+          "row": 8,
+          "col": 1,
+          "input": "可能已过滤的 logits[B,V]",
+          "output": "probs[B,V]，每行之和为 1",
+          "details": [
+            "softmax 沿最后一维计算；被置 -inf 的 token 概率为 0。",
+            "这一步输出概率；前面所有 logits 都只是未归一化分数。"
+          ],
+          "example": "上述 top-2 例子的非零概率：P(ID1)=0.622459，P(ID6)=0.377541。这是教学计算，不是模型实测。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G10",
+          "title": "按概率采一个 token",
+          "subtitle": "torch.multinomial(...,1)",
+          "row": 9,
+          "col": 1,
+          "input": "probs[B,V]",
+          "output": "idx_next[B,1]",
+          "details": [
+            "每个 batch 样本独立采一个 token。",
+            "采样不等于 argmax；可采到较低但非零概率的 token。具体输出依赖随机状态。"
+          ],
+          "example": "为了走通教学路径，假设本次抽到 ID1；这不是实际调用 nanoGPT 得到的输出。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G11",
+          "title": "拼回完整序列",
+          "subtitle": "torch.cat((idx,idx_next),dim=1)",
+          "row": 10,
+          "col": 1,
+          "input": "完整 idx[B,L]；idx_next[B,1]",
+          "output": "完整 idx[B,L+1]；返回循环控制",
+          "details": [
+            "拼接对象是完整 idx，不是裁剪后的 idx_cond。",
+            "继续迭代时再根据新长度决定上下文窗口。"
+          ],
+          "example": "原 [[0,1,2,3,4]] + 教学抽样 [[1]] → [[0,1,2,3,4,1]]；完整输出长度为 6。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "step"
+        },
+        {
+          "id": "G12",
+          "title": "返回完整生成序列",
+          "subtitle": "return idx",
+          "row": 1,
+          "col": 2,
+          "input": "原始 token + 所有新 token",
+          "output": "LongTensor[B,L_initial+N]（N>=0）",
+          "details": [
+            "返回值包含原始提示词，不仅包含新生成部分。",
+            "sample.py 再把 token ID 转回文本并打印。词表必须与所用权重匹配。"
+          ],
+          "example": "本例返回 6 个 token；N=0 时原样返回 5 个 token。",
+          "sources": [
+            "gen"
+          ],
+          "kind": "terminal"
+        }
+      ],
+      "edges": [
+        {
+          "from": "G00",
+          "to": "G01",
+          "label": "初始完整序列"
+        },
+        {
+          "from": "G01",
+          "to": "G12",
+          "label": "否：循环结束",
+          "from_side": "right",
+          "to_side": "left"
+        },
+        {
+          "from": "G01",
+          "to": "G02",
+          "label": "是：执行一轮"
+        },
+        {
+          "from": "G02",
+          "to": "G03",
+          "label": "未超长：保留"
+        },
+        {
+          "from": "G02",
+          "to": "G04",
+          "label": "超长：裁剪"
+        },
+        {
+          "from": "G03",
+          "to": "G05",
+          "label": "idx_cond[B,T]"
+        },
+        {
+          "from": "G04",
+          "to": "G05",
+          "label": "idx_cond[B,block_size]"
+        },
+        {
+          "from": "G05",
+          "to": "G06",
+          "label": "最后位置 logits"
+        },
+        {
+          "from": "G06",
+          "to": "G07",
+          "label": "温度调整后分数"
+        },
+        {
+          "from": "G07",
+          "to": "G08",
+          "label": "是：top_k 非 None"
+        },
+        {
+          "from": "G07",
+          "to": "G09",
+          "label": "否：保留所有分数",
+          "from_side": "right",
+          "to_side": "right",
+          "via": [
+            [
+              670,
+              1007
+            ],
+            [
+              670,
+              1319
+            ]
+          ]
+        },
+        {
+          "from": "G08",
+          "to": "G09",
+          "label": "过滤后的 logits"
+        },
+        {
+          "from": "G09",
+          "to": "G10",
+          "label": "概率 [B,V]"
+        },
+        {
+          "from": "G10",
+          "to": "G11",
+          "label": "新 token [B,1]"
+        },
+        {
+          "from": "G11",
+          "to": "G01",
+          "label": "下一次迭代",
+          "from_side": "left",
+          "to_side": "left",
+          "via": [
+            [
+              12,
+              1631
+            ],
+            [
+              12,
+              227
+            ]
+          ],
+          "label_at": [
+            95,
+            920
+          ]
+        }
+      ]
+    }
+  ],
+  "examples": [
+    {
+      "id": "train",
+      "title": "案例 A · 有标签的训练前向",
+      "provenance": "源码推演 · 未运行 PyTorch",
+      "description": [
+        "用三个 token 预测右移一位的三个标签。假定该环境没有 SDPA 接口，展开显式注意力路径；这里只追踪一个代表性 Block，实际 n_layer=2 会重复两次。"
+      ],
+      "input": {
+        "idx": [
+          [
+            1,
+            2,
+            3
+          ]
+        ],
+        "targets": [
+          [
+            2,
+            3,
+            4
+          ]
+        ],
+        "training": true,
+        "dropout": 0.0
+      },
+      "output": "logits[1,3,8] 与标量 loss；具体浮点数依赖实际权重，未测量。",
+      "paths": {
+        "forward": [
+          {
+            "node": "F01",
+            "input": {
+              "idx": [
+                [
+                  1,
+                  2,
+                  3
+                ]
+              ],
+              "targets": [
+                [
+                  2,
+                  3,
+                  4
+                ]
+              ]
+            },
+            "output": "b=1,t=3"
+          },
+          {
+            "node": "F02",
+            "input": "t 与 config.block_size",
+            "output": "通过断言，或抛出 AssertionError"
+          },
+          {
+            "node": "F03",
+            "input": "idx[1,3]；pos=[0,1,2]",
+            "output": "tok_emb[1,3,4] + pos_emb[3,4] → x[1,3,4]"
+          },
+          {
+            "node": "F04",
+            "input": "x[1,3,4]",
+            "output": "x[1,3,4]；经过 n_layer 层"
+          },
+          {
+            "node": "F05",
+            "input": "最后一层 Block 输出[1,3,4]",
+            "output": "归一化后的 x[1,3,4]"
+          },
+          {
+            "node": "F06",
+            "input": "targets=[[2,3,4]]",
+            "output": "全位置 logits + CE"
+          },
+          {
+            "node": "F07",
+            "input": "x[1,3,4]；targets=[[2,3,4]]",
+            "output": "logits[1,3,8]；CE([3,8],[3]) → 标量 loss"
+          },
+          {
+            "node": "F09",
+            "input": "全位置分支结果",
+            "output": "(logits[1,3,8], scalar loss)"
+          }
+        ],
+        "block": [
+          {
+            "node": "B01",
+            "input": "x[1,3,4]",
+            "output": "z1[1,3,4]"
+          },
+          {
+            "node": "B02",
+            "input": "z1[1,3,4]",
+            "output": "a[1,3,4]"
+          },
+          {
+            "node": "B03",
+            "input": "原 x[1,3,4] 与 a[1,3,4]",
+            "output": "x1[1,3,4]"
+          },
+          {
+            "node": "B04",
+            "input": "x1[1,3,4]",
+            "output": "z2[1,3,4]"
+          },
+          {
+            "node": "B05",
+            "input": "z2[1,3,4]",
+            "output": "中间激活[1,3,16]"
+          },
+          {
+            "node": "B06",
+            "input": "中间激活[1,3,16]",
+            "output": "m[1,3,4]"
+          },
+          {
+            "node": "B07",
+            "input": "x1[1,3,4] 与 m[1,3,4]",
+            "output": "下一层 Block 的输入[1,3,4]"
+          }
+        ],
+        "attention": [
+          {
+            "node": "A01",
+            "input": "x[1,3,4]，且 C % H == 0",
+            "output": "读取 B,T,C；每头维度 d=C/H"
+          },
+          {
+            "node": "A02",
+            "input": "x[1,3,4]",
+            "output": "Q,K,V 各 [1,2,3,2]"
+          },
+          {
+            "node": "A03",
+            "input": "self.flash=False",
+            "output": "显式矩阵路径"
+          },
+          {
+            "node": "A05",
+            "input": "Q/K[1,2,3,2]",
+            "output": "scores[1,2,3,3]；上三角为 -inf"
+          },
+          {
+            "node": "A06",
+            "input": "weights[1,2,3,3]；V[1,2,3,2]",
+            "output": "y[1,2,3,2]"
+          },
+          {
+            "node": "A07",
+            "input": "y[1,2,3,2]",
+            "output": "投影与 Dropout 后[1,3,4]"
+          },
+          {
+            "node": "A08",
+            "input": "最终注意力输出[1,3,4]",
+            "output": "a[1,3,4]；由 B03 与主干相加"
+          }
+        ]
+      }
+    },
+    {
+      "id": "long",
+      "title": "案例 B · 长上下文 + top-k 生成",
+      "provenance": "源码推演 · 抽样结果为教学假设",
+      "description": [
+        "原始长度 5 超过窗口 4，只把末尾 4 个 token 送入模型。使用 SDPA 接口分支，top_k=2，生成 1 个 token。教学 logits 和假设抽中的 ID 不来自真实模型权重。"
+      ],
+      "input": {
+        "idx": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        ],
+        "max_new_tokens": 1,
+        "block_size": 4,
+        "temperature": 1,
+        "top_k": 2
+      },
+      "output": "形状确定为 [1,6]；教学假设抽中 ID1 时，返回 [[0,1,2,3,4,1]]。",
+      "paths": {
+        "generation": [
+          {
+            "node": "G00",
+            "input": "idx=[[0,1,2,3,4]], N=1, block_size=4, top_k=2",
+            "output": "进入生成循环"
+          },
+          {
+            "node": "G01",
+            "input": "固定生成次数的循环控制",
+            "output": "是：执行下一轮"
+          },
+          {
+            "node": "G02",
+            "input": "L=5，窗口=4",
+            "output": "5>4，走裁剪"
+          },
+          {
+            "node": "G04",
+            "input": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            ],
+            "output": [
+              [
+                1,
+                2,
+                3,
+                4
+              ]
+            ]
+          },
+          {
+            "node": "G05",
+            "input": [
+              [
+                1,
+                2,
+                3,
+                4
+              ]
+            ],
+            "output": "logits[1,1,8],None"
+          },
+          {
+            "node": "G06",
+            "input": "教学 logits=[1,2,0,-1,0.5,-0.5,1.5,-2]；temperature=1",
+            "output": "scaled logits 保持不变"
+          },
+          {
+            "node": "G07",
+            "input": "top_k=2",
+            "output": "进入 top-k 过滤"
+          },
+          {
+            "node": "G08",
+            "input": "top_k=2；第2大阈值=1.5",
+            "output": "ID1:2.0；ID6:1.5；其余 -inf"
+          },
+          {
+            "node": "G09",
+            "input": "非屏蔽分数=[2.0,1.5]",
+            "output": "P(ID1)=0.622459；P(ID6)=0.377541"
+          },
+          {
+            "node": "G10",
+            "input": "教学概率分布",
+            "output": "教学假设 idx_next=[[1]]，非实测"
+          },
+          {
+            "node": "G11",
+            "input": "完整 idx 长度5 + idx_next长度1",
+            "output": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4,
+                1
+              ]
+            ]
+          },
+          {
+            "node": "G01",
+            "input": "固定生成次数的循环控制",
+            "output": "否：退出循环"
+          },
+          {
+            "node": "G12",
+            "input": "已生成1个token，结束循环",
+            "output": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4,
+                1
+              ]
+            ]
+          }
+        ],
+        "forward": [
+          {
+            "node": "F01",
+            "input": {
+              "idx": [
+                [
+                  1,
+                  2,
+                  3,
+                  4
+                ]
+              ],
+              "targets": null
+            },
+            "output": "B=1,T=4"
+          },
+          {
+            "node": "F02",
+            "input": "t 与 config.block_size",
+            "output": "通过断言，或抛出 AssertionError"
+          },
+          {
+            "node": "F03",
+            "input": "idx[1,4]；pos=arange(T)[T]",
+            "output": "x[1,4,4]"
+          },
+          {
+            "node": "F04",
+            "input": "x[1,4,4]",
+            "output": "x[1,4,4]；经过 n_layer 层"
+          },
+          {
+            "node": "F05",
+            "input": "最后一层 Block 输出[1,4,4]",
+            "output": "归一化后的 x[1,4,4]"
+          },
+          {
+            "node": "F06",
+            "input": "targets=None",
+            "output": "仅末位置投影"
+          },
+          {
+            "node": "F08",
+            "input": "x[1,4,4]",
+            "output": "x_last[1,1,4] → logits[1,1,8]"
+          },
+          {
+            "node": "F09",
+            "input": "无 targets",
+            "output": "(logits[1,1,8],None)"
+          }
+        ],
+        "block": [
+          {
+            "node": "B01",
+            "input": "x[1,4,4]",
+            "output": "z1[1,4,4]"
+          },
+          {
+            "node": "B02",
+            "input": "z1[1,4,4]",
+            "output": "a[1,4,4]"
+          },
+          {
+            "node": "B03",
+            "input": "原 x[1,4,4] 与 a[1,4,4]",
+            "output": "x1[1,4,4]"
+          },
+          {
+            "node": "B04",
+            "input": "x1[1,4,4]",
+            "output": "z2[1,4,4]"
+          },
+          {
+            "node": "B05",
+            "input": "z2[1,4,4]",
+            "output": "中间激活[1,4,16]"
+          },
+          {
+            "node": "B06",
+            "input": "中间激活[1,4,16]",
+            "output": "m[1,4,4]"
+          },
+          {
+            "node": "B07",
+            "input": "x1[1,4,4] 与 m[1,4,4]",
+            "output": "下一层 Block 的输入[1,4,4]"
+          }
+        ],
+        "attention": [
+          {
+            "node": "A01",
+            "input": "x[1,4,4]，且 C % H == 0",
+            "output": "读取 B,T,C；每头维度 d=C/H"
+          },
+          {
+            "node": "A02",
+            "input": "x[1,4,4]",
+            "output": "Q/K/V 各 [1,2,4,2]"
+          },
+          {
+            "node": "A03",
+            "input": "self.flash=True",
+            "output": "SDPA 接口路径"
+          },
+          {
+            "node": "A04",
+            "input": "q,k,v[1,2,4,2]；is_causal=True；dropout_p=0",
+            "output": "y[1,2,4,2]"
+          },
+          {
+            "node": "A07",
+            "input": "y[1,2,4,2]",
+            "output": "投影与 Dropout 后[1,4,4]"
+          },
+          {
+            "node": "A08",
+            "input": "最终注意力输出[1,4,4]",
+            "output": "a[1,4,4]；由 B03 与主干相加"
+          }
+        ]
+      }
+    },
+    {
+      "id": "short",
+      "title": "案例 C · 短上下文，不做 top-k",
+      "provenance": "源码推演 · 未运行 PyTorch",
+      "description": [
+        "输入没有超过窗口，保留整个上下文。top_k=None，因此没有阈值过滤；所有有限分数 token 都参与 softmax。"
+      ],
+      "input": {
+        "idx": [
+          [
+            1,
+            2,
+            3
+          ]
+        ],
+        "max_new_tokens": 1,
+        "temperature": 1,
+        "top_k": null
+      },
+      "output": "返回 [1,4] token 张量；具体抽中的 ID 未知。",
+      "paths": {
+        "generation": [
+          {
+            "node": "G00",
+            "input": "idx[B,L]；max_new_tokens=N；temperature；top_k",
+            "output": "进入无梯度生成循环"
+          },
+          {
+            "node": "G01",
+            "input": "固定生成次数的循环控制",
+            "output": "是：执行下一轮"
+          },
+          {
+            "node": "G02",
+            "input": "完整 idx[B,L]",
+            "output": "选择保留全部或保留末尾窗口"
+          },
+          {
+            "node": "G03",
+            "input": [
+              [
+                1,
+                2,
+                3
+              ]
+            ],
+            "output": [
+              [
+                1,
+                2,
+                3
+              ]
+            ]
+          },
+          {
+            "node": "G05",
+            "input": "idx_cond[1,3]，T<=block_size",
+            "output": "logits[1,1,8]；loss=None"
+          },
+          {
+            "node": "G06",
+            "input": "logits[1,1,8]；temperature>0",
+            "output": "scaled logits[1,8]"
+          },
+          {
+            "node": "G07",
+            "input": "top_k=None",
+            "output": "跳过 G08，不做过滤"
+          },
+          {
+            "node": "G09",
+            "input": "可能已过滤的 logits[1,8]",
+            "output": "probs[1,8]，每行之和为 1"
+          },
+          {
+            "node": "G10",
+            "input": "完整词表 softmax 概率",
+            "output": "随机 token[B,1]；没有实测 ID"
+          },
+          {
+            "node": "G11",
+            "input": "idx[1,3] + token[1,1]",
+            "output": "idx[1,4]"
+          },
+          {
+            "node": "G01",
+            "input": "固定生成次数的循环控制",
+            "output": "否：退出循环"
+          },
+          {
+            "node": "G12",
+            "input": "完成 1 次迭代",
+            "output": "完整序列[1,4]"
+          }
+        ],
+        "forward": [
+          {
+            "node": "F01",
+            "input": "idx: LongTensor[1,3]；可选 targets[1,3]",
+            "output": "读取 b,t 和 idx.device"
+          },
+          {
+            "node": "F02",
+            "input": "t 与 config.block_size",
+            "output": "通过断言，或抛出 AssertionError"
+          },
+          {
+            "node": "F03",
+            "input": "idx[1,3]；pos=arange(T)[T]",
+            "output": "x[1,3,4]"
+          },
+          {
+            "node": "F04",
+            "input": "x[1,3,4]",
+            "output": "x[1,3,4]；经过 n_layer 层"
+          },
+          {
+            "node": "F05",
+            "input": "最后一层 Block 输出[1,3,4]",
+            "output": "归一化后的 x[1,3,4]"
+          },
+          {
+            "node": "F06",
+            "input": "targets=None",
+            "output": "仅末位置投影"
+          },
+          {
+            "node": "F08",
+            "input": "x[1,3,4]；targets=None",
+            "output": "logits[1,1,8]；loss=None"
+          },
+          {
+            "node": "F09",
+            "input": "F07 或 F08 的结果",
+            "output": "(logits, loss)"
+          }
+        ],
+        "block": [
+          {
+            "node": "B01",
+            "input": "x[1,3,4]",
+            "output": "z1[1,3,4]"
+          },
+          {
+            "node": "B02",
+            "input": "z1[1,3,4]",
+            "output": "a[1,3,4]"
+          },
+          {
+            "node": "B03",
+            "input": "原 x[1,3,4] 与 a[1,3,4]",
+            "output": "x1[1,3,4]"
+          },
+          {
+            "node": "B04",
+            "input": "x1[1,3,4]",
+            "output": "z2[1,3,4]"
+          },
+          {
+            "node": "B05",
+            "input": "z2[1,3,4]",
+            "output": "中间激活[1,3,16]"
+          },
+          {
+            "node": "B06",
+            "input": "中间激活[1,3,16]",
+            "output": "m[1,3,4]"
+          },
+          {
+            "node": "B07",
+            "input": "x1[1,3,4] 与 m[1,3,4]",
+            "output": "下一层 Block 的输入[1,3,4]"
+          }
+        ],
+        "attention": [
+          {
+            "node": "A01",
+            "input": "x[1,3,4]，且 C % H == 0",
+            "output": "读取 B,T,C；每头维度 d=C/H"
+          },
+          {
+            "node": "A02",
+            "input": "x[1,3,4]",
+            "output": "q,k,v 各为[1,2,3,2]"
+          },
+          {
+            "node": "A03",
+            "input": "self.flash=False",
+            "output": "显式矩阵路径"
+          },
+          {
+            "node": "A05",
+            "input": "q,k[1,2,3,2]",
+            "output": "遮罩后的 scores[1,2,3,3]"
+          },
+          {
+            "node": "A06",
+            "input": "scores[1,2,3,3]；v[1,2,3,2]",
+            "output": "y[1,2,3,2]"
+          },
+          {
+            "node": "A07",
+            "input": "y[1,2,3,2]",
+            "output": "投影与 Dropout 后[1,3,4]"
+          },
+          {
+            "node": "A08",
+            "input": "最终注意力输出[1,3,4]",
+            "output": "a[1,3,4]；由 B03 与主干相加"
+          }
+        ]
+      }
+    },
+    {
+      "id": "invalid",
+      "title": "案例 D · 直接 forward 输入过长",
+      "provenance": "源码推演 · 异常出口",
+      "description": [
+        "绕过 generate，直接调用 forward。这里没有窗口裁剪，会在长度断言失败后结束。"
+      ],
+      "input": {
+        "idx": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        ],
+        "block_size": 4
+      },
+      "output": "AssertionError；不返回 logits 或 loss。",
+      "paths": {
+        "forward": [
+          {
+            "node": "F01",
+            "input": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            ],
+            "output": "B=1,T=5"
+          },
+          {
+            "node": "F02",
+            "input": "5 <= 4",
+            "output": false
+          },
+          {
+            "node": "FX",
+            "input": "T=5, block_size=4",
+            "output": "AssertionError: Cannot forward sequence of length 5, block size is only 4"
+          }
+        ]
+      }
+    },
+    {
+      "id": "zero",
+      "title": "案例 E · 生成 0 个新 token",
+      "provenance": "源码推演 · 零次循环",
+      "description": [
+        "max_new_tokens=0，循环体一次也不执行。即使原序列超过窗口，也不会触发 forward 的长度断言，因为根本没有调用它。"
+      ],
+      "input": {
+        "idx": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        ],
+        "max_new_tokens": 0,
+        "block_size": 4
+      },
+      "output": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4
+        ]
+      ],
+      "paths": {
+        "generation": [
+          {
+            "node": "G00",
+            "input": "idx长度5；N=0",
+            "output": "进入 for range(0)"
+          },
+          {
+            "node": "G01",
+            "input": "range(0)",
+            "output": "循环体不执行"
+          },
+          {
+            "node": "G12",
+            "input": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            ],
+            "output": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "modules": [
+    {
+      "name": "GPTConfig 与 GPT.__init__",
+      "location": "model.py:108–148",
+      "input": "词表、上下文长度、层数、头数、隐藏维度、Dropout、bias 配置",
+      "output": "GPT 模块；初始化后的可学习参数",
+      "details": [
+        "创建 wte[V,C]、wpe[block_size,C]、Dropout、n_layer 个 Block、最终 LayerNorm 和无 bias 的 lm_head。",
+        "wte.weight 与 lm_head.weight 共享同一个参数，不是复制数值后各自更新。普通 Linear 和 Embedding 按 N(0,0.02²) 初始化，Linear 的可选 bias 置零。",
+        "以 c_proj.weight 结尾的注意力和 MLP 投影再按标准差 0.02/sqrt(2*n_layer) 特殊初始化。LayerNorm weight 初始为 1，可选 bias 初始为 0。",
+        "构造时要求 vocab_size/block_size 非 None；各注意力模块还检查 C 可被 H 整除。bias=False 时 Linear/LayerNorm 不创建偏置。"
+      ],
+      "example": "教学配置 V=8,C=4,L=2,H=2,block_size=4；共享权重形状为 [8,4]，不要理解成两份独立矩阵。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "LayerNorm",
+      "location": "model.py:18–27",
+      "input": "任意末维为 C 的隐藏张量；学习缩放与可选偏置",
+      "output": "相同形状的张量",
+      "details": "沿最后一维使用 F.layer_norm，epsilon=1e-5。逐 token 归一化，不跨时间位置混合。",
+      "example": "[1,3,4] → [1,3,4]。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "CausalSelfAttention",
+      "location": "model.py:29–76",
+      "input": "x[B,T,C]，C%H=0",
+      "output": "注意力增量[B,T,C]",
+      "details": "完整 SDPA / 显式计算分支见 A01–A08；残差加法在 Block 中。",
+      "example": "[1,3,4] → Q/K/V[1,2,3,2] → [1,3,4]。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "MLP",
+      "location": "model.py:78–92",
+      "input": "隐藏序列[B,T,C]",
+      "output": "特征变换[B,T,C]",
+      "details": "依次 Linear(C,4C)、GELU、Linear(4C,C)、Dropout；不同 token 独立使用相同参数。",
+      "example": "[1,3,4] → [1,3,16] → [1,3,4]。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "Block",
+      "location": "model.py:94–106",
+      "input": "隐藏序列[B,T,C]",
+      "output": "隐藏序列[B,T,C]",
+      "details": "完整 Pre-LN 与两条残差见 B01–B07。",
+      "example": "形状不变，但向量内容经过注意力和 MLP 更新。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "GPT.forward",
+      "location": "model.py:170–193",
+      "input": "idx[B,T]，可选 targets[B,T]",
+      "output": "有标签：[B,T,V]+标量 loss；无标签：[B,1,V]+None",
+      "details": "完整分支、长度失败出口、位置查表和层循环见 F01–F09。",
+      "example": "idx=[[1,2,3]],targets=[[2,3,4]] → [1,3,8]+loss。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "crop_block_size",
+      "location": "model.py:195–204",
+      "input": "新的 block_size，必须不大于当前值",
+      "output": "无显式返回值；修改 config、wpe 参数及可能存在的遮罩 buffer",
+      "details": [
+        "先断言只允许缩短；截取位置 Embedding 权重并包装成新的 Parameter。",
+        "逐层检查是否有手工注意力 bias buffer；有则同步裁剪，没有则跳过。这是修改模型结构，区别于 generate 中临时裁剪 token 输入。"
+      ],
+      "example": "模型窗口 1024 → 256：wpe 只保留前 256 行；尝试扩大到 2048 会断言失败。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "from_pretrained",
+      "location": "model.py:206–261",
+      "input": "gpt2/gpt2-medium/gpt2-large/gpt2-xl；可选 dropout 覆盖",
+      "output": "装载预训练权重后的 GPT 对象",
+      "details": [
+        "仅允许已列出的四种模型名，override_args 只允许 dropout。按模型名设 L/H/C，固定 V=50257、block_size=1024、bias=True。",
+        "初始化本地 GPT，再通过 transformers 加载 GPT2LMHeadModel。过滤注意力遮罩 buffer 后比较状态字典键数量。",
+        "遇到 attn.c_attn / attn.c_proj / mlp.c_fc / mlp.c_proj 的 weight，先断言转置形状匹配，再转置拷贝；其余参数要求形状相同后直接拷贝。此处未执行网络下载和加载。"
+      ],
+      "example": "GPT-2 的 Conv1D 权重若为 [C,3C]，本地 Linear 需要 [3C,C]，因此转置。这个例子不是说所有参数都要转置。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "configure_optimizers",
+      "location": "model.py:263–287",
+      "input": "模型参数、weight_decay、learning_rate、betas、device_type",
+      "output": "AdamW 优化器对象",
+      "details": [
+        "先排除 requires_grad=False 参数。维度 >=2 的参数进入 weight_decay 组，维度 <2 的进入 decay=0 组；所以 Embedding 会衰减。",
+        "仅当 AdamW 签名存在 fused 且 device_type==cuda 时传 fused=True；否则使用普通构造。这里只构造优化器，不更新权重。"
+      ],
+      "example": "wte.weight[8,4] 属衰减组；LayerNorm.weight[4] 属不衰减组；CPU 不启用 fused。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "_init_weights / get_num_params",
+      "location": "model.py:150–168",
+      "input": "初始化模块，或 non_embedding 布尔值",
+      "output": "初始化函数无返回；统计函数返回参数元素总数",
+      "details": [
+        "_init_weights 区分 Linear 与 Embedding；其它类型不由此函数处理。",
+        "get_num_params 默认从总参数数减去 wpe 的位置参数；共享 token/lm_head 参数仍保留，因为也承担输出投影。"
+      ],
+      "example": "教学 wpe[4,4] 有 16 个元素；默认统计会减去这 16 个，不减共享 token 权重。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "estimate_mfu",
+      "location": "model.py:289–303",
+      "input": "每次迭代的前后向次数 fwdbwd_per_iter 与耗时 dt>0",
+      "output": "相对 A100 BF16 峰值的估算比率",
+      "details": [
+        "用参数数、L/H/Q/T 估算 FLOPs，再除实际传入时间和源码硬编码的 312e12 FLOPS。",
+        "它不是 GPU 硬件利用率传感器，换设备不会自动换峰值。报告不能把这个估算当成测得的性能。"
+      ],
+      "example": "即使在其它 GPU 上调用，分母仍是 A100 的常数；本演示没有性能数值。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "GPT.generate",
+      "location": "model.py:305–330",
+      "input": "token idx、生成次数、温度、可选 top_k",
+      "output": "包含原提示词和新增 token 的完整序列",
+      "details": "上下文裁剪、forward、温度、top-k、采样与回边见 G00–G12；只有固定次数停止。",
+      "example": "长度 5 + 生成 1 → 返回长度 6，即使模型只看到末尾 4 个。",
+      "status": "源码已读 · 静态解释"
+    },
+    {
+      "name": "训练端与采样端的连接",
+      "location": "train.py:114–131,290–314；sample.py:30–89",
+      "input": "已准备的二进制 token 数据，或提示文字与 tokenizer",
+      "output": "训练批次/参数更新，或生成文本",
+      "details": [
+        "get_batch 的 x 取连续窗口，y 从同一窗口向右偏移 1。训练循环用 model(X,Y)，按累积次数缩放 loss 后 backward，必要时裁剪梯度，再 step/update/zero_grad。",
+        "sample.py 从检查点或 GPT-2 初始化，执行 eval；优先读取数据集 meta.pkl 的字符映射，否则假定 GPT-2 编码。支持从 FILE: 提示文件读文本；编码后加 batch 维，调用 generate，再 decode 打印。",
+        "本报告完整展开的执行范围是 model.py 核心。train.py 的 DDP、学习率、检查点循环和 sample.py 的全部初始化分支只作连接说明，不声称全仓库均已画完。"
+      ],
+      "example": "连续 token [1,2,3,4] 构造 x=[1,2,3]、y=[2,3,4]；sample 输入 token[3] 加 batch 维成 [1,3]。",
+      "status": "连接点已读 · 非全文件覆盖"
+    }
+  ],
+  "sources": [
+    {
+      "id": "ln",
+      "label": "model.py:18–27 · LayerNorm",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L18-L27",
+      "code": " 18  class LayerNorm(nn.Module):\n 19      \"\"\" LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False \"\"\"\n 20  \n 21      def __init__(self, ndim, bias):\n 22          super().__init__()\n 23          self.weight = nn.Parameter(torch.ones(ndim))\n 24          self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None\n 25  \n 26      def forward(self, input):\n 27          return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "att",
+      "label": "model.py:29–76 · CausalSelfAttention",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L29-L76",
+      "code": " 29  class CausalSelfAttention(nn.Module):\n 30  \n 31      def __init__(self, config):\n 32          super().__init__()\n 33          assert config.n_embd % config.n_head == 0\n 34          # key, query, value projections for all heads, but in a batch\n 35          self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)\n 36          # output projection\n 37          self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)\n 38          # regularization\n 39          self.attn_dropout = nn.Dropout(config.dropout)\n 40          self.resid_dropout = nn.Dropout(config.dropout)\n 41          self.n_head = config.n_head\n 42          self.n_embd = config.n_embd\n 43          self.dropout = config.dropout\n 44          # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0\n 45          self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')\n 46          if not self.flash:\n 47              print(\"WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0\")\n 48              # causal mask to ensure that attention is only applied to the left in the input sequence\n 49              self.register_buffer(\"bias\", torch.tril(torch.ones(config.block_size, config.block_size))\n 50                                          .view(1, 1, config.block_size, config.block_size))\n 51  \n 52      def forward(self, x):\n 53          B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)\n 54  \n 55          # calculate query, key, values for all heads in batch and move head forward to be the batch dim\n 56          q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)\n 57          k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)\n 58          q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)\n 59          v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)\n 60  \n 61          # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)\n 62          if self.flash:\n 63              # efficient attention using Flash Attention CUDA kernels\n 64              y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)\n 65          else:\n 66              # manual implementation of attention\n 67              att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))\n 68              att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))\n 69              att = F.softmax(att, dim=-1)\n 70              att = self.attn_dropout(att)\n 71              y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)\n 72          y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side\n 73  \n 74          # output projection\n 75          y = self.resid_dropout(self.c_proj(y))\n 76          return y",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "mlp",
+      "label": "model.py:78–92 · MLP",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L78-L92",
+      "code": " 78  class MLP(nn.Module):\n 79  \n 80      def __init__(self, config):\n 81          super().__init__()\n 82          self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)\n 83          self.gelu    = nn.GELU()\n 84          self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)\n 85          self.dropout = nn.Dropout(config.dropout)\n 86  \n 87      def forward(self, x):\n 88          x = self.c_fc(x)\n 89          x = self.gelu(x)\n 90          x = self.c_proj(x)\n 91          x = self.dropout(x)\n 92          return x",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "block",
+      "label": "model.py:94–106 · Block",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L94-L106",
+      "code": " 94  class Block(nn.Module):\n 95  \n 96      def __init__(self, config):\n 97          super().__init__()\n 98          self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)\n 99          self.attn = CausalSelfAttention(config)\n100          self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)\n101          self.mlp = MLP(config)\n102  \n103      def forward(self, x):\n104          x = x + self.attn(self.ln_1(x))\n105          x = x + self.mlp(self.ln_2(x))\n106          return x",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "init",
+      "label": "model.py:108–168 · 配置、初始化与统计",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L108-L168",
+      "code": "108  @dataclass\n109  class GPTConfig:\n110      block_size: int = 1024\n111      vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency\n112      n_layer: int = 12\n113      n_head: int = 12\n114      n_embd: int = 768\n115      dropout: float = 0.0\n116      bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster\n117  \n118  class GPT(nn.Module):\n119  \n120      def __init__(self, config):\n121          super().__init__()\n122          assert config.vocab_size is not None\n123          assert config.block_size is not None\n124          self.config = config\n125  \n126          self.transformer = nn.ModuleDict(dict(\n127              wte = nn.Embedding(config.vocab_size, config.n_embd),\n128              wpe = nn.Embedding(config.block_size, config.n_embd),\n129              drop = nn.Dropout(config.dropout),\n130              h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),\n131              ln_f = LayerNorm(config.n_embd, bias=config.bias),\n132          ))\n133          self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)\n134          # with weight tying when using torch.compile() some warnings get generated:\n135          # \"UserWarning: functional_call was passed multiple values for tied weights.\n136          # This behavior is deprecated and will be an error in future versions\"\n137          # not 100% sure what this is, so far seems to be harmless. TODO investigate\n138          self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying\n139  \n140          # init all weights\n141          self.apply(self._init_weights)\n142          # apply special scaled init to the residual projections, per GPT-2 paper\n143          for pn, p in self.named_parameters():\n144              if pn.endswith('c_proj.weight'):\n145                  torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))\n146  \n147          # report number of parameters\n148          print(\"number of parameters: %.2fM\" % (self.get_num_params()/1e6,))\n149  \n150      def get_num_params(self, non_embedding=True):\n151          \"\"\"\n152          Return the number of parameters in the model.\n153          For non-embedding count (default), the position embeddings get subtracted.\n154          The token embeddings would too, except due to the parameter sharing these\n155          params are actually used as weights in the final layer, so we include them.\n156          \"\"\"\n157          n_params = sum(p.numel() for p in self.parameters())\n158          if non_embedding:\n159              n_params -= self.transformer.wpe.weight.numel()\n160          return n_params\n161  \n162      def _init_weights(self, module):\n163          if isinstance(module, nn.Linear):\n164              torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)\n165              if module.bias is not None:\n166                  torch.nn.init.zeros_(module.bias)\n167          elif isinstance(module, nn.Embedding):\n168              torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "fwd",
+      "label": "model.py:170–193 · GPT.forward",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L170-L193",
+      "code": "170      def forward(self, idx, targets=None):\n171          device = idx.device\n172          b, t = idx.size()\n173          assert t <= self.config.block_size, f\"Cannot forward sequence of length {t}, block size is only {self.config.block_size}\"\n174          pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)\n175  \n176          # forward the GPT model itself\n177          tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)\n178          pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)\n179          x = self.transformer.drop(tok_emb + pos_emb)\n180          for block in self.transformer.h:\n181              x = block(x)\n182          x = self.transformer.ln_f(x)\n183  \n184          if targets is not None:\n185              # if we are given some desired targets also calculate the loss\n186              logits = self.lm_head(x)\n187              loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)\n188          else:\n189              # inference-time mini-optimization: only forward the lm_head on the very last position\n190              logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim\n191              loss = None\n192  \n193          return logits, loss",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "crop",
+      "label": "model.py:195–204 · crop_block_size",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L195-L204",
+      "code": "195      def crop_block_size(self, block_size):\n196          # model surgery to decrease the block size if necessary\n197          # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)\n198          # but want to use a smaller block size for some smaller, simpler model\n199          assert block_size <= self.config.block_size\n200          self.config.block_size = block_size\n201          self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])\n202          for block in self.transformer.h:\n203              if hasattr(block.attn, 'bias'):\n204                  block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "pretrained",
+      "label": "model.py:206–261 · from_pretrained",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L206-L261",
+      "code": "206      @classmethod\n207      def from_pretrained(cls, model_type, override_args=None):\n208          assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}\n209          override_args = override_args or {} # default to empty dict\n210          # only dropout can be overridden see more notes below\n211          assert all(k == 'dropout' for k in override_args)\n212          from transformers import GPT2LMHeadModel\n213          print(\"loading weights from pretrained gpt: %s\" % model_type)\n214  \n215          # n_layer, n_head and n_embd are determined from model_type\n216          config_args = {\n217              'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params\n218              'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params\n219              'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params\n220              'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params\n221          }[model_type]\n222          print(\"forcing vocab_size=50257, block_size=1024, bias=True\")\n223          config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints\n224          config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints\n225          config_args['bias'] = True # always True for GPT model checkpoints\n226          # we can override the dropout rate, if desired\n227          if 'dropout' in override_args:\n228              print(f\"overriding dropout rate to {override_args['dropout']}\")\n229              config_args['dropout'] = override_args['dropout']\n230          # create a from-scratch initialized minGPT model\n231          config = GPTConfig(**config_args)\n232          model = GPT(config)\n233          sd = model.state_dict()\n234          sd_keys = sd.keys()\n235          sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param\n236  \n237          # init a huggingface/transformers model\n238          model_hf = GPT2LMHeadModel.from_pretrained(model_type)\n239          sd_hf = model_hf.state_dict()\n240  \n241          # copy while ensuring all of the parameters are aligned and match in names and shapes\n242          sd_keys_hf = sd_hf.keys()\n243          sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer\n244          sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)\n245          transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']\n246          # basically the openai checkpoints use a \"Conv1D\" module, but we only want to use a vanilla Linear\n247          # this means that we have to transpose these weights when we import them\n248          assert len(sd_keys_hf) == len(sd_keys), f\"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}\"\n249          for k in sd_keys_hf:\n250              if any(k.endswith(w) for w in transposed):\n251                  # special treatment for the Conv1D weights we need to transpose\n252                  assert sd_hf[k].shape[::-1] == sd[k].shape\n253                  with torch.no_grad():\n254                      sd[k].copy_(sd_hf[k].t())\n255              else:\n256                  # vanilla copy over the other parameters\n257                  assert sd_hf[k].shape == sd[k].shape\n258                  with torch.no_grad():\n259                      sd[k].copy_(sd_hf[k])\n260  \n261          return model",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "opt",
+      "label": "model.py:263–287 · configure_optimizers",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L263-L287",
+      "code": "263      def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):\n264          # start with all of the candidate parameters\n265          param_dict = {pn: p for pn, p in self.named_parameters()}\n266          # filter out those that do not require grad\n267          param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}\n268          # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.\n269          # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.\n270          decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]\n271          nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]\n272          optim_groups = [\n273              {'params': decay_params, 'weight_decay': weight_decay},\n274              {'params': nodecay_params, 'weight_decay': 0.0}\n275          ]\n276          num_decay_params = sum(p.numel() for p in decay_params)\n277          num_nodecay_params = sum(p.numel() for p in nodecay_params)\n278          print(f\"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters\")\n279          print(f\"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters\")\n280          # Create AdamW optimizer and use the fused version if it is available\n281          fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters\n282          use_fused = fused_available and device_type == 'cuda'\n283          extra_args = dict(fused=True) if use_fused else dict()\n284          optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)\n285          print(f\"using fused AdamW: {use_fused}\")\n286  \n287          return optimizer",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "mfu",
+      "label": "model.py:289–303 · estimate_mfu",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L289-L303",
+      "code": "289      def estimate_mfu(self, fwdbwd_per_iter, dt):\n290          \"\"\" estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS \"\"\"\n291          # first estimate the number of flops we do per iteration.\n292          # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311\n293          N = self.get_num_params()\n294          cfg = self.config\n295          L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size\n296          flops_per_token = 6*N + 12*L*H*Q*T\n297          flops_per_fwdbwd = flops_per_token * T\n298          flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter\n299          # express our flops throughput as ratio of A100 bfloat16 peak flops\n300          flops_achieved = flops_per_iter * (1.0/dt) # per second\n301          flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS\n302          mfu = flops_achieved / flops_promised\n303          return mfu",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "gen",
+      "label": "model.py:305–330 · generate",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L305-L330",
+      "code": "305      @torch.no_grad()\n306      def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):\n307          \"\"\"\n308          Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete\n309          the sequence max_new_tokens times, feeding the predictions back into the model each time.\n310          Most likely you'll want to make sure to be in model.eval() mode of operation for this.\n311          \"\"\"\n312          for _ in range(max_new_tokens):\n313              # if the sequence context is growing too long we must crop it at block_size\n314              idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]\n315              # forward the model to get the logits for the index in the sequence\n316              logits, _ = self(idx_cond)\n317              # pluck the logits at the final step and scale by desired temperature\n318              logits = logits[:, -1, :] / temperature\n319              # optionally crop the logits to only the top k options\n320              if top_k is not None:\n321                  v, _ = torch.topk(logits, min(top_k, logits.size(-1)))\n322                  logits[logits < v[:, [-1]]] = -float('Inf')\n323              # apply softmax to convert logits to (normalized) probabilities\n324              probs = F.softmax(logits, dim=-1)\n325              # sample from the distribution\n326              idx_next = torch.multinomial(probs, num_samples=1)\n327              # append sampled index to the running sequence and continue\n328              idx = torch.cat((idx, idx_next), dim=1)\n329  \n330          return idx",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "batch",
+      "label": "train.py:114–131 · get_batch",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/train.py#L114-L131",
+      "code": "114  # poor man's data loader\n115  data_dir = os.path.join('data', dataset)\n116  def get_batch(split):\n117      # We recreate np.memmap every batch to avoid a memory leak, as per\n118      # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122\n119      if split == 'train':\n120          data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')\n121      else:\n122          data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')\n123      ix = torch.randint(len(data) - block_size, (batch_size,))\n124      x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])\n125      y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])\n126      if device_type == 'cuda':\n127          # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)\n128          x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)\n129      else:\n130          x, y = x.to(device), y.to(device)\n131      return x, y",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "update",
+      "label": "train.py:290–314 · 梯度累积与更新",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/train.py#L290-L314",
+      "code": "290      # forward backward update, with optional gradient accumulation to simulate larger batch size\n291      # and using the GradScaler if data type is float16\n292      for micro_step in range(gradient_accumulation_steps):\n293          if ddp:\n294              # in DDP training we only need to sync gradients at the last micro step.\n295              # the official way to do this is with model.no_sync() context manager, but\n296              # I really dislike that this bloats the code and forces us to repeat code\n297              # looking at the source of that context manager, it just toggles this variable\n298              model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)\n299          with ctx:\n300              logits, loss = model(X, Y)\n301              loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation\n302          # immediately async prefetch next batch while model is doing the forward pass on the GPU\n303          X, Y = get_batch('train')\n304          # backward pass, with gradient scaling if training in fp16\n305          scaler.scale(loss).backward()\n306      # clip the gradient\n307      if grad_clip != 0.0:\n308          scaler.unscale_(optimizer)\n309          torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)\n310      # step the optimizer and scaler if training in fp16\n311      scaler.step(optimizer)\n312      scaler.update()\n313      # flush the gradients as soon as we can, no need for this memory anymore\n314      optimizer.zero_grad(set_to_none=True)",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    },
+    {
+      "id": "sampling",
+      "label": "sample.py:30–89 · 编码与生成调用",
+      "url": "https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/sample.py#L30-L89",
+      "code": " 30  device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast\n 31  ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]\n 32  ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)\n 33  \n 34  # model\n 35  if init_from == 'resume':\n 36      # init from a model saved in a specific directory\n 37      ckpt_path = os.path.join(out_dir, 'ckpt.pt')\n 38      checkpoint = torch.load(ckpt_path, map_location=device)\n 39      gptconf = GPTConfig(**checkpoint['model_args'])\n 40      model = GPT(gptconf)\n 41      state_dict = checkpoint['model']\n 42      unwanted_prefix = '_orig_mod.'\n 43      for k,v in list(state_dict.items()):\n 44          if k.startswith(unwanted_prefix):\n 45              state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)\n 46      model.load_state_dict(state_dict)\n 47  elif init_from.startswith('gpt2'):\n 48      # init from a given GPT-2 model\n 49      model = GPT.from_pretrained(init_from, dict(dropout=0.0))\n 50  \n 51  model.eval()\n 52  model.to(device)\n 53  if compile:\n 54      model = torch.compile(model) # requires PyTorch 2.0 (optional)\n 55  \n 56  # look for the meta pickle in case it is available in the dataset folder\n 57  load_meta = False\n 58  if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...\n 59      meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')\n 60      load_meta = os.path.exists(meta_path)\n 61  if load_meta:\n 62      print(f\"Loading meta from {meta_path}...\")\n 63      with open(meta_path, 'rb') as f:\n 64          meta = pickle.load(f)\n 65      # TODO want to make this more general to arbitrary encoder/decoder schemes\n 66      stoi, itos = meta['stoi'], meta['itos']\n 67      encode = lambda s: [stoi[c] for c in s]\n 68      decode = lambda l: ''.join([itos[i] for i in l])\n 69  else:\n 70      # ok let's assume gpt-2 encodings by default\n 71      print(\"No meta.pkl found, assuming GPT-2 encodings...\")\n 72      enc = tiktoken.get_encoding(\"gpt2\")\n 73      encode = lambda s: enc.encode(s, allowed_special={\"<|endoftext|>\"})\n 74      decode = lambda l: enc.decode(l)\n 75  \n 76  # encode the beginning of the prompt\n 77  if start.startswith('FILE:'):\n 78      with open(start[5:], 'r', encoding='utf-8') as f:\n 79          start = f.read()\n 80  start_ids = encode(start)\n 81  x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])\n 82  \n 83  # run generation\n 84  with torch.no_grad():\n 85      with ctx:\n 86          for k in range(num_samples):\n 87              y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)\n 88              print(decode(y[0].tolist()))\n 89              print('---------------')",
+      "note": "上游 nanoGPT / Andrej Karpathy / MIT；原始版本与许可证一并保存在 source/。"
+    }
+  ],
+  "math_notes": [
+    {
+      "title": "手算一头注意力：每一步都能复核",
+      "explanation": [
+        "以下 Q/K/V 是人为构造的小矩阵，不是实际模型激活。仅模拟 d=2、T=3、dropout=0 的一头显式计算，暂不包含 QKV 投影、其它头和输出投影。",
+        "第一个 query 只能看自己，所以其输出恰好为第一个 V。第二个 query 只能汇总前两个 V，第三个才能汇总全部三个。"
+      ],
+      "values": {
+        "Q": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "K": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "V": [
+          [
+            10,
+            0
+          ],
+          [
+            0,
+            20
+          ],
+          [
+            30,
+            30
+          ]
+        ],
+        "masked_scores": [
+          [
+            0.707107,
+            "-inf",
+            "-inf"
+          ],
+          [
+            0.0,
+            0.707107,
+            "-inf"
+          ],
+          [
+            0.707107,
+            0.707107,
+            1.414214
+          ]
+        ],
+        "weights": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.330238,
+            0.669762,
+            0.0
+          ],
+          [
+            0.248255,
+            0.248255,
+            0.50349
+          ]
+        ],
+        "weighted_V": [
+          [
+            10.0,
+            0.0
+          ],
+          [
+            3.302385,
+            13.395231
+          ],
+          [
+            17.587246,
+            20.069797
+          ]
+        ]
+      }
+    },
+    {
+      "title": "手算 top-k、概率和一个位置的损失",
+      "explanation": [
+        "教学 logits 长度为 V=8，与教学配置一致。top_k=2 后只保留分数 2.0 与 1.5（本例没有并列）。",
+        "交叉熵例子用相同未过滤 logits，目标 ID1；只是一个位置的 CE，不是整批训练 loss，也不是生成时额外计算 loss。"
+      ],
+      "values": {
+        "logits": [
+          1,
+          2,
+          0,
+          -1,
+          0.5,
+          -0.5,
+          1.5,
+          -2
+        ],
+        "top_k": 2,
+        "retained_ids": [
+          1,
+          6
+        ],
+        "retained_probabilities": [
+          0.622459,
+          0.377541
+        ],
+        "single_position_CE_target_ID1": 0.909493
+      }
+    }
+  ],
+  "verification": [
+    {
+      "status": "源码确认",
+      "title": "固定版本、逐行依据",
+      "detail": "源码固定到 3adf61e154c3fe3fca428ad6bc3818b27a3b8291；model.py 330 行已阅读。源码摘录按原始行号生成，上游许可证保留。"
+    },
+    {
+      "status": "独立教学计算",
+      "title": "注意力与概率数值",
+      "detail": "标准库计算 softmax、因果注意力与一个位置的 CE，并检查概率和与因果首位置输出。这验证教学算术，不验证 nanoGPT 的 PyTorch 实现。"
+    },
+    {
+      "status": "未执行",
+      "title": "原始模型、训练与推理",
+      "detail": "当前环境没有 PyTorch；未加载检查点、未执行 nanoGPT、未测精度、速度、显存或 SDPA 后端。所有案例均明确标为源码推演。"
+    },
+    {
+      "status": "浏览器与结构检查",
+      "title": "HTML 与数据格式",
+      "detail": "发行前由构建脚本检查步骤/边/案例引用，另在浏览器检查桌面、窄屏、路径选择、缩放、源码跳转和打印。具体检查记录见仓库 VALIDATION.md。"
+    }
+  ],
+  "limitations": [
+    "形状推演假设合法 token ID、有效 targets、正温度、合法 top_k 和可用依赖。源码并未对每个非法参数提供友好校验；例如 top_k=0 或 temperature=0 不应当作正常配置。",
+    "案例覆盖核心输出分支、注意力实现选择、上下文保留/裁剪、top-k 有/无、长度断言和零次生成。Dropout 非零训练、权重下载、检查点兼容与硬件后端未实测。",
+    "生成示例假设抽中某个 ID 只为说明拼接与回路，不能用于评估语言能力。该源码采用 GPT-2 风格结构，与现代大型模型可能存在位置编码、归一化、MLP、缓存等差异。"
+  ],
+  "footer": "Built with code-to-report · nanoGPT © 2022 Andrej Karpathy / MIT · Source 3adf61e154c3 · No remote runtime resources."
+}
